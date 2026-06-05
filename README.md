@@ -172,7 +172,7 @@ Pull requests are welcome! For major changes, please open an issue first to disc
 
 ## 👤 Author
 
-**Your Name**
+**Kundan Kumar**
 - LinkedIn: [linkedin.com/in/your-profile](https://linkedin.com/in/your-profile)
 - GitHub: [@your-username](https://github.com/your-username)
 
