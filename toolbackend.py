@@ -1,113 +1,120 @@
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph,START,END
 from typing import TypedDict,Annotated
-from langchain_core.messages import BaseMessage
-from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
-import sqlite3
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt import tools_condition
 from langchain_core.tools import tool
 from datetime import datetime
-
+from langgraph.checkpoint.postgres import PostgresSaver
+import psycopg
+import os
+from psycopg.rows import dict_row
 
 load_dotenv()
-llm = ChatGroq(model = "llama-3.1-8b-instant")
-# llm2 = ChatGroq(model = "llama-3.3-70b-versatile")
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
+
+system_prompt = SystemMessage(content="""
+You are a helpful assistant with access to tools.
+
+You can use these tools:
+- web_search(query: str): Search the web for current information about events, news, or facts.
+- get_current_datetime(): Get the current date and time.
+- calculate_expression(expression: str): Calculate a math expression.
+
+When you call a tool, always provide its parameters as a JSON object.
+For example:
+{"query": "latest AI news"}
+{"expression": "2+2"}
+
+Always be concise and accurate. Provide direct answers.
+"""
+)
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+class chatState(TypedDict):
+  messages:Annotated[list[BaseMessage],add_messages]
+
 #-------TOOOLSS----------------
-@tool
-def web_search(query: str) -> str:
-    """Search the web for a given query string to find live or current information."""
-    search = DuckDuckGoSearchRun()
-    return search.run(query)
 
 @tool
-def get_current_datetime()->str:
-  """Returns the current date and time.Always Use this when there is mention of any time realted things like 'today','tommorow',or 'schedule',time or date"""
-  return f"The current date and time is: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+def web_search(query: str) -> str:
+    """Search the web for information.
+    
+    Args:
+        query: Search query string
+    
+    Returns:
+        Search results
+    """
+    return DuckDuckGoSearchAPIWrapper().run(query)
+    
+
+@tool
+def get_current_datetime() -> str:
+    """Get current date and time.
+    
+    Returns:
+        Current date and time in YYYY-MM-DD HH:MM:SS format
+    """
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 @tool
 def calculate_expression(expression: str) -> str:
-    """Evaluates a basic mathematical expression safely. Use this whenever the user asks for math or calculations."""
-    try:
-        # Using a restricted dictionary for safe evaluation of basic math
-        allowed_names = {"__builtins__": None, "abs": abs, "round": round}
-        result = eval(expression, allowed_names, {})
-        return f"Result: {result}"
-    except Exception as e:
-        return f"Error evaluating expression: {str(e)}"
+    """Calculate a math expression.
+    Args:
+        expression: Math expression to calculate (e.g., 2+2, 10*5)
+    Returns:
+        Result of calculation
+    """
+    allowed_names = {"__builtins__": {}, "abs": abs, "round": round}
+    result = eval(expression, allowed_names)
+    return str(result)
 
 
 
 tools=[web_search,calculate_expression,get_current_datetime]
 llm_with_tools = llm.bind_tools(tools)
 
-class chatState(TypedDict):
-  messages:Annotated[list[BaseMessage],add_messages]
-
 
 
 def chat_node(state:chatState):
-  """LLM Node that may answer or request a tool call.And It always Provide a Very structured and Beatiful response"""
+  """Call tools instantly if needed. Respond beautifully using clear Markdown, headers, and bullet points. Greet the user warmly if they greet you. Keep sentences short and punchy.
+"""
   messages = state['messages']
+  # Ensure messages is always a list
+  if not isinstance(messages, list):
+    messages = [messages]
+
+  # Include system instructions so the model knows how to use the tools correctly.
+  messages = [system_prompt] + messages
+
   response = llm_with_tools.invoke(messages)
-  return {"messages":[response]}
+  return {"messages": [response]}
 
-# def structured(state: chatState) -> chatState:
-#     """
-#     Enhances raw conversation output into a structured, professional,
-#     and user-friendly response.
-#     """
 
-#     # Extract message history
-#     messages = state.get("messages", [])
-
-#     # Convert messages into readable text
-#     conversation_history = "\n".join(
-#         [
-#             f"{msg.type.upper()}: {msg.content}"
-#             if hasattr(msg, "content")
-#             else str(msg)
-#             for msg in messages
-#         ]
-#     )
-
-#     # Professional structuring prompt
-#     prompt = f"""
-# You are a senior AI communication expert.
-
-# Your task is to transform the message into a highly structured,
-# professional, polished, and easy-to-read response.
-# Message:
-# {state['messages']}
-# """
-
-#     # Invoke secondary LLM
-#     response = llm2.invoke(prompt)
-
-#     # Return updated state
-#     return {"messages": [response]}
 
 tool_node = ToolNode(tools)
 
-conn=sqlite3.connect(database='chatbot.db',check_same_thread=False)
-checkpointer = SqliteSaver(conn=conn)
 
 graph = StateGraph(chatState)
 
 graph.add_node("chat_node",chat_node)
 graph.add_node('tools',tool_node)
-# graph.add_node('structured',structured)
 
 
 graph.add_edge(START,"chat_node")
 graph.add_conditional_edges("chat_node",tools_condition)
 graph.add_edge("tools","chat_node")
-# graph.add_edge("chat_node","structured")
 
+_conn = psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+checkpointer = PostgresSaver(_conn)
+checkpointer.setup()
 chatbot = graph.compile(checkpointer=checkpointer)
 
 def retrieve_all_threads():
